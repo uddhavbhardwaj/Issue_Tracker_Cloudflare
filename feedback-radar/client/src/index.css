@@ -1,0 +1,26 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-[#1E1E1E] text-[#D9D9D9] font-sans antialiased;
+}
+
+/* Custom Scrollbar - matching dark theme */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-[#141414];
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-[#404040] rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-[#555555];
+}
