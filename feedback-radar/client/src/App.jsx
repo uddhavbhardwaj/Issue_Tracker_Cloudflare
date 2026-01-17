@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-const API_URL = 'http://localhost:8787/api';
+const API_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787/api';
 
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
