@@ -24,3 +24,40 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   @apply bg-[#555555];
 }
+
+/* Line clamp utilities for truncating text */
+.line-clamp-1 {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Improved contrast for better readability */
+.text-enhanced {
+  color: #E5E5E5;
+}
+
+/* Theme icon animations */
+@keyframes pulse-subtle {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.8;
+  }
+}
+
+.theme-icon {
+  animation: pulse-subtle 2s ease-in-out infinite;
+}

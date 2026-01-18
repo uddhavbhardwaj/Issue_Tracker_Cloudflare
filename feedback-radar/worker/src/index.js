@@ -1,6 +1,16 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { FeedbackWorkflow } from './workflow';
+import { processSingleFeedback, validateFeedbackData } from './feedback-processor';
+import {
+    processFeedbackBatch,
+    formatBatchResponse,
+    formatBatchResponseWithStatus,
+    validateFeedbackBatch,
+    formatValidationErrors,
+    determineHttpStatusCode,
+    createErrorResponse
+} from './batch-processor';
 
 const app = new Hono();
 
@@ -10,98 +20,117 @@ app.get('/', (c) => {
     return c.text('Feedback Radar API');
 });
 
-// Mock Data Seeder
-app.post('/api/seed', async (c) => {
-    const { results } = await c.env.DB.prepare(`
-    INSERT INTO feedback (content, source, sentiment, urgency_score, urgency_reason, themes, status) VALUES
-    ('The login page is broken and I cannot access my account!', 'Support Ticket', 'Negative', 9, 'User cannot access account (critical blocker)', '["Login", "Bug"]', 'New'),
-    ('I really like the new dashboard design, it is much cleaner.', 'Twitter', 'Positive', 2, 'Positive feedback, no action needed', '["UI/UX", "Dashboard"]', 'New'),
-    ('Can you add a dark mode?', 'Feature Request', 'Neutral', 4, 'Feature request, not urgent', '["Feature Request", "UI/UX"]', 'New'),
-    ('Billing is confusing. I do not know why I was charged this amount.', 'Email', 'Negative', 7, 'Billing confusion affects customer trust', '["Billing", "UX"]', 'New'),
-    ('Everything is working great, thanks!', 'Chat', 'Positive', 1, 'General praise', '["General"]', 'Archived')
-    RETURNING *
-  `).all();
 
-    // Trigger workflows to vectorise this data (if available)
-    let workflowsTriggered = 0;
-    for (const feedback of results) {
-        try {
-            if (c.env.FEEDBACK_WORKFLOW && typeof c.env.FEEDBACK_WORKFLOW.create === 'function') {
-                await c.env.FEEDBACK_WORKFLOW.create({
-                    id: `seed-${feedback.id}`,
-                    params: {
-                        feedbackId: feedback.id,
-                        content: feedback.content,
-                        source: feedback.source
-                    }
-                });
-                workflowsTriggered++;
-            }
-        } catch (e) {
-            console.warn('Workflow creation failed (may not be available in local dev):', e.message);
-        }
-    }
-
-    return c.json({
-        message: workflowsTriggered > 0
-            ? 'Seeded successfully (Background processing started)'
-            : 'Seeded successfully (Workflows not available in local dev)',
-        results
-    });
-});
 
 app.post('/api/feedback', async (c) => {
-    let content, source, file;
-
-    // Handle both JSON and Multipart (for file uploads)
-    const contentType = c.req.header('content-type') || '';
-
-    if (contentType.includes('multipart/form-data')) {
-        const body = await c.req.parseBody();
-        content = body['content'];
-        source = body['source'];
-        file = body['file']; // File object
-    } else {
-        const json = await c.req.json();
-        content = json.content;
-        source = json.source;
-    }
-
-    // 1. Upload to R2 if file exists
-    let imageUrl = null;
-    if (file && (file instanceof File || file instanceof Blob)) {
-        const key = `${Date.now()}-${file.name || 'upload'}`;
-        await c.env.FEEDBACK_BUCKET.put(key, file);
-        imageUrl = key; // In a real app, you'd serve this via a worker or public bucket URL
-    }
-
-    // 2. Save initial "Pending" record to D1
-    const { results } = await c.env.DB.prepare(`
-    INSERT INTO feedback (content, source, sentiment, urgency_score, urgency_reason, themes, status, image_key)
-    VALUES (?, ?, 'Pending', 0, 'Analyzing...', '[]', 'New', ?)
-    RETURNING *
-  `).bind(content, source || 'Unknown', imageUrl).all();
-
-    const feedback = results[0];
-
-    // 3. Trigger Workflow for async analysis (if available)
     try {
-        if (c.env.FEEDBACK_WORKFLOW && typeof c.env.FEEDBACK_WORKFLOW.create === 'function') {
-            await c.env.FEEDBACK_WORKFLOW.create({
-                id: `feedback-${feedback.id}`, // specific ID or auto-generated
-                params: {
-                    feedbackId: feedback.id,
-                    content: content,
-                    source: source
-                }
-            });
-        }
-    } catch (e) {
-        console.warn('Workflow creation failed (may not be available in local dev):', e.message);
-    }
+        const contentType = c.req.header('content-type') || '';
+        let feedbackData = null;
+        let isBatch = false;
+        let batchData = [];
 
-    return c.json({ ...feedback, message: "Feedback received. Analysis in progress." });
+        // 1. Parse Input
+        if (contentType.includes('application/json')) {
+            const tempBody = await c.req.json();
+
+            // Check if it's a batch payload (mockData or feedback array)
+            if (tempBody.mockData && Array.isArray(tempBody.mockData)) {
+                isBatch = true;
+                batchData = tempBody.mockData;
+            } else if (tempBody.feedback && Array.isArray(tempBody.feedback)) {
+                isBatch = true;
+                batchData = tempBody.feedback;
+            } else {
+                // Assume Single Feedback JSON
+                feedbackData = {
+                    content: tempBody.content,
+                    source: tempBody.source,
+                    timestamp: tempBody.timestamp
+                };
+            }
+
+        } else if (contentType.includes('multipart/form-data')) {
+            const body = await c.req.parseBody();
+            feedbackData = {
+                content: body['content'],
+                source: body['source'],
+                timestamp: body['timestamp'],
+                file: body['file'] // File object
+            };
+        } else {
+            return c.json({ error: 'Unsupported Content-Type. Use application/json or multipart/form-data' }, 400);
+        }
+
+        // 2. Process Based on Type
+        if (isBatch) {
+            // --- BATCH PROCESSING ---
+            // Validate the feedback array structure
+            const validation = validateFeedbackBatch(batchData);
+
+            if (!validation.success) {
+                const errorResponse = formatValidationErrors(validation);
+                return c.json(errorResponse, 400);
+            }
+
+            // Process the batch
+            const batchResult = await processFeedbackBatch(batchData, c.env);
+            const response = formatBatchResponseWithStatus(batchResult);
+            const statusCode = determineHttpStatusCode(batchResult);
+
+            return c.json(response, statusCode);
+
+        } else {
+            // --- SINGLE PROCESSING ---
+            // Normalize undefined to null or empty string if needed, but validation will catch it.
+            // Explicitly force mandatory fields check here (though validateFeedbackData does it, we double check context)
+            if (!feedbackData.content || !feedbackData.source || !feedbackData.timestamp) {
+                return c.json({
+                    error: 'Invalid feedback data',
+                    fieldErrors: {
+                        content: !feedbackData.content ? ['Content is required'] : undefined,
+                        source: !feedbackData.source ? ['Source is required'] : undefined,
+                        timestamp: !feedbackData.timestamp ? ['Timestamp is required'] : undefined
+                    }
+                }, 400);
+            }
+
+            const validation = validateFeedbackData(feedbackData);
+
+            if (!validation.isValid) {
+                const errorResponse = {
+                    error: 'Invalid feedback data',
+                    summary: validation.summary,
+                    fieldErrors: validation.fieldErrors,
+                    generalErrors: validation.generalErrors,
+                    warnings: validation.warnings,
+                    details: validation.errors // Legacy
+                };
+                return c.json(errorResponse, 400);
+            }
+
+            const result = await processSingleFeedback(feedbackData, c.env);
+
+            // Include validation warnings in successful response if present
+            if (validation.warnings && validation.warnings.length > 0) {
+                result.warnings = validation.warnings;
+            }
+
+            return c.json(result);
+        }
+
+    } catch (error) {
+        console.error('Feedback processing failed:', error);
+        const errorResponse = createErrorResponse(
+            'processing_error',
+            'Failed to process feedback',
+            { message: error.message },
+            500
+        );
+        return c.json(errorResponse, 500);
+    }
 });
+
+
 
 app.get('/api/feedback/:id/similar', async (c) => {
     const id = c.req.param('id');
@@ -148,56 +177,154 @@ app.get('/api/feedback/:id/similar', async (c) => {
         `SELECT * FROM feedback WHERE id IN (${placeholders})`
     ).bind(...similarIds).all();
 
+    // Debug info if empty
+    if (similarFeedback.results.length === 0) {
+        console.log("No DB matches found for similar IDs:", similarIds, "Vector matches were:", matches.matches);
+        return c.json({ info: "No DB matches, but Vector matches were:", raw: matches.matches });
+    }
+
     return c.json(similarFeedback.results);
 });
 
 app.get('/api/dashboard', async (c) => {
     try {
-        // Aggregate stats via SQL - only for active feedback (New and Pending)
-        // Sentiment breakdown (exclude 'Pending' as it's not a valid sentiment)
-        const sentimentStats = await c.env.DB.prepare(`
-        SELECT sentiment, COUNT(*) as count 
-        FROM feedback 
-        WHERE status IN ('New', 'Pending')
-        AND sentiment IN ('Positive', 'Neutral', 'Negative')
-        GROUP BY sentiment
-      `).all();
+        const timeFilter = c.req.query('period') || '7d'; // 24h, 7d, 30d, all
 
-        // Fetch themes only from active feedback (not Acted On or Archived)
-        const allThemes = await c.env.DB.prepare(`
-        SELECT themes 
-        FROM feedback 
-        WHERE status IN ('New', 'Pending')
-      `).all();
+        // Calculate time boundaries
+        const now = new Date();
+        let currentPeriodStart = new Date(now);
+        let previousPeriodStart = new Date(now);
 
-        const themeCounts = {};
-        allThemes.results.forEach(row => {
-            try {
-                const themes = JSON.parse(row.themes);
-                if (Array.isArray(themes)) {
-                    themes.forEach(t => {
-                        themeCounts[t] = (themeCounts[t] || 0) + 1;
-                    });
-                }
-            } catch (e) { }
+        switch (timeFilter) {
+            case '24h':
+                currentPeriodStart.setHours(now.getHours() - 24);
+                previousPeriodStart.setHours(now.getHours() - 48);
+                break;
+            case '7d':
+                currentPeriodStart.setDate(now.getDate() - 7);
+                previousPeriodStart.setDate(now.getDate() - 14);
+                break;
+            case '30d':
+                currentPeriodStart.setDate(now.getDate() - 30);
+                previousPeriodStart.setDate(now.getDate() - 60);
+                break;
+            default: // 'all'
+                currentPeriodStart = new Date(0);
+                previousPeriodStart = new Date(0);
+        }
+
+        // Fetch current period feedback
+        const currentFeedback = await c.env.DB.prepare(`
+            SELECT * FROM feedback 
+            WHERE status IN ('New', 'Pending')
+            AND created_at >= ?
+        `).bind(currentPeriodStart.toISOString()).all();
+
+        // Fetch previous period for trend comparison
+        const previousFeedback = await c.env.DB.prepare(`
+            SELECT * FROM feedback 
+            WHERE status IN ('New', 'Pending')
+            AND created_at >= ? AND created_at < ?
+        `).bind(previousPeriodStart.toISOString(), currentPeriodStart.toISOString()).all();
+
+        // Import insights engine functions
+        const {
+            calculateTopRisk,
+            detectEmergingIssues,
+            identifyWins,
+            generateRecommendations,
+            calculateTrends,
+            getSourceBreakdown,
+            getEnhancedThemes
+        } = await import('./insights-engine.js');
+
+        const current = currentFeedback.results || [];
+        const previous = previousFeedback.results || [];
+
+        // Calculate insights
+        const topRisk = calculateTopRisk(current);
+        const emergingIssues = detectEmergingIssues(current, previous);
+        const wins = identifyWins(current);
+        const recommendations = generateRecommendations(current, topRisk, emergingIssues);
+        const trends = calculateTrends(current, previous);
+        const sourceBreakdown = getSourceBreakdown(current);
+        const enhancedThemes = getEnhancedThemes(current, 5);
+
+        // Calculate sentiment with percentages
+        const totalCount = current.length;
+        const sentimentWithPercentages = ['Positive', 'Neutral', 'Negative'].map(sentiment => {
+            const count = current.filter(f => f.sentiment === sentiment).length;
+            const percentage = totalCount > 0 ? Math.round((count / totalCount) * 100) : 0;
+            const trend = trends[sentiment];
+
+            return {
+                sentiment,
+                count,
+                percentage,
+                trend: trend ? {
+                    direction: trend.direction,
+                    change: trend.change,
+                    percentChange: trend.percentChange
+                } : null
+            };
         });
 
-        // Sort themes
-        const topThemes = Object.entries(themeCounts)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5)
-            .map(([name, count]) => ({ name, count }));
+        // Calculate primary KPI
+        const negativeCount = current.filter(f => f.sentiment === 'Negative').length;
+        const criticalIssues = current.filter(f => f.severity === 'blocking').length;
+        const negativePercentage = totalCount > 0 ? Math.round((negativeCount / totalCount) * 100) : 0;
+
+        const primaryKPI = {
+            metric: 'negative_percentage',
+            value: negativePercentage,
+            label: '% Negative Feedback',
+            secondaryMetric: {
+                value: criticalIssues,
+                label: 'Critical Issues'
+            },
+            status: negativePercentage < 10 ? 'good' : negativePercentage < 25 ? 'warning' : 'critical',
+            trend: trends.Negative ? {
+                direction: trends.Negative.direction,
+                change: trends.Negative.percentChange
+            } : null
+        };
+
+        // Insights summary
+        const insightsSummary = {
+            topRisk: topRisk ? {
+                theme: topRisk.theme,
+                count: topRisk.count,
+                blockingCount: topRisk.blockingCount,
+                sample: topRisk.samples[0]
+            } : null,
+            emergingIssues: emergingIssues.map(issue => ({
+                theme: issue.theme,
+                growthRate: issue.growthRate,
+                currentCount: issue.currentCount,
+                isNew: issue.isNew,
+                sample: issue.sample
+            })),
+            recentWins: wins
+        };
 
         return c.json({
-            sentiment: sentimentStats.results || [],
-            top_themes: topThemes
+            period: timeFilter,
+            totalFeedback: totalCount,
+            primaryKPI,
+            insightsSummary,
+            sentiment: sentimentWithPercentages,
+            themes: enhancedThemes,
+            recommendations,
+            sourceBreakdown,
+            lastUpdated: new Date().toISOString()
         });
     } catch (error) {
         console.error('Dashboard error:', error);
         return c.json({
             error: 'Failed to load dashboard data',
+            message: error.message,
             sentiment: [],
-            top_themes: []
+            themes: []
         }, 500);
     }
 }); // End of dashboard endpoint
@@ -225,6 +352,89 @@ app.post('/api/inbox/:id', async (c) => {
   `).bind(status, id).run();
 
     return c.json({ success: true });
+});
+
+// Roadmap API endpoints
+app.post('/api/roadmap/link', async (c) => {
+    try {
+        const { feedbackId, roadmapStatus, roadmapLink } = await c.req.json();
+
+        await c.env.DB.prepare(`
+            UPDATE feedback 
+            SET roadmap_status = ?, roadmap_link = ?
+            WHERE id = ?
+        `).bind(roadmapStatus, roadmapLink || null, feedbackId).run();
+
+        return c.json({ success: true });
+    } catch (error) {
+        return c.json({ error: 'Failed to link roadmap item', message: error.message }, 500);
+    }
+});
+
+app.get('/api/roadmap/items', async (c) => {
+    try {
+        const status = c.req.query('status') || 'all'; // planned, in_progress, shipped, all
+
+        let query = 'SELECT * FROM feedback WHERE roadmap_status != ?';
+        const params = ['none'];
+
+        if (status !== 'all') {
+            query = 'SELECT * FROM feedback WHERE roadmap_status = ?';
+            params[0] = status;
+        }
+
+        const { results } = await c.env.DB.prepare(query).bind(...params).all();
+
+        return c.json(results);
+    } catch (error) {
+        return c.json({ error: 'Failed to fetch roadmap items', message: error.message }, 500);
+    }
+});
+
+app.get('/api/roadmap/:id/sentiment', async (c) => {
+    try {
+        const id = c.req.param('id');
+
+        // Get the feedback item
+        const { results } = await c.env.DB.prepare('SELECT * FROM feedback WHERE id = ?').bind(id).all();
+        if (!results.length) return c.json({ error: 'Feedback not found' }, 404);
+
+        const item = results[0];
+        const themes = JSON.parse(item.themes || '[]');
+
+        // Get sentiment before shipping (feedback created before this item was shipped)
+        const beforeSentiment = await c.env.DB.prepare(`
+            SELECT sentiment, COUNT(*) as count
+            FROM feedback
+            WHERE themes LIKE ? AND created_at < ?
+            GROUP BY sentiment
+        `).bind(`%${themes[0]}%`, item.created_at).all();
+
+        // Get sentiment after shipping (feedback created after)
+        const afterSentiment = await c.env.DB.prepare(`
+            SELECT sentiment, COUNT(*) as count
+            FROM feedback
+            WHERE themes LIKE ? AND created_at >= ?
+            GROUP BY sentiment
+        `).bind(`%${themes[0]}%`, item.created_at).all();
+
+        const formatSentiment = (results) => {
+            const sentiment = { positive: 0, neutral: 0, negative: 0 };
+            results.forEach(r => {
+                sentiment[r.sentiment.toLowerCase()] = r.count;
+            });
+            return sentiment;
+        };
+
+        return c.json({
+            theme: themes[0],
+            before: formatSentiment(beforeSentiment.results || []),
+            after: formatSentiment(afterSentiment.results || []),
+            roadmapLink: item.roadmap_link
+        });
+    } catch (error) {
+        return c.json({ error: 'Failed to calculate sentiment', message: error.message }, 500);
+    }
 });
 
 app.get('/api/images/:key', async (c) => {
